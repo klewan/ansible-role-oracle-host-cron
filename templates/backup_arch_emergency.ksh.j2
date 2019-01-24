@@ -1,0 +1,349 @@
+#!/bin/ksh
+# ----------------------------------------------------------------------
+# File: backup_arch_emergency.ksh
+#
+# This script fires archivelog backup when arch filesystem / ASM threshold is exceeded
+#
+# History:
+#
+# Date       Author       Comments
+# ---------- ------------ ----------------------------------------------
+# 30/08/2016 KLewandowski Created
+# 19/09/2016 KLewandowski Updated: for exadata
+# ----------------------------------------------------------------------
+#
+# SYNTAX : backup_arch_emergency.ksh [MAX_ARCH_USAGE] [NO_CvOraSID]
+#
+
+# if no parameters provided set MAX_ARCH_USAGE={{ item.extra_vars.max_arch_usage | default(70,true) }}
+if [ $# -eq 0 ]
+then
+  MAX_ARCH_USAGE={{ item.extra_vars.max_arch_usage | default(70,true) }}
+else
+  MAX_ARCH_USAGE=$1
+fi
+
+DIR="$(dirname $0)"
+if [ "$DIR" = "." ]
+then
+  DIR=$(pwd)
+fi
+
+LOG_DIR=$DIR
+
+#
+# Create logfile
+#
+
+VDATE="$(date +%Y%m%d_%H%M%S)"
+SCRIPT="$(basename $0 .ksh)"
+#echo "Logfile -> $LOG_DIR/${SCRIPT}.log"
+# To enable logging uncomment next line
+#exec 1>>$LOG_DIR/${SCRIPT}.log 2>&1
+echo ""
+echo "======="
+echo "$SCRIPT : Timestamp: $(date +%Y-%m-%d_%H:%M:%S)"
+echo "======="
+
+# Get os name
+OS_NAME="$(uname -s)"
+
+# Get oratab location
+case $OS_NAME in
+  AIX) ORATAB=/etc/oratab ;;
+  Linux) ORATAB=/etc/oratab ;;
+  HP-UX) ORATAB=/etc/oratab ;;
+  SunOS) ORATAB=/var/opt/oracle/oratab ;;
+  *) echo "Unknown O/S"
+     return 1 ;;
+esac
+
+if [ ! -f $ORATAB ]
+then
+  echo "Cannot find oratab file"
+  exit 1
+fi
+
+BASE_PATH=$PATH
+
+# iterate over oratab entries
+for LINE in $(awk ' $1!~ /[#*]/ {print $1} ' $ORATAB | sed '/^$/d' | grep -iv +ASM | cut -d: -f1,2)
+do
+  ORACLE_SID=`echo $LINE|cut -d: -f1`
+  export ORACLE_SID
+  ORACLE_HOME=`echo $LINE|cut -d: -f2`
+  export ORACLE_HOME
+  export PATH=$ORACLE_HOME/bin:$BASE_PATH
+  export ORADBNAME=$ORACLE_SID
+
+  # check if the database is up and in addition to that amend ORACLE_SID in case of RAC system
+  SKIP="yes"
+  export CVORARACDBNAME=""
+  for SIDs in $(ps -eaf | grep ora_smon_${ORACLE_SID} | grep -v grep | awk '{print $NF}' | cut -d"_" -f3)
+  do
+    if [ "$SIDs" = "${ORACLE_SID}" ]
+    then
+      SKIP="no"
+    elif [ "$SIDs" = "${ORACLE_SID}1" ]
+    then
+      SKIP="no"
+      export CVORARACDBNAME=$ORACLE_SID
+      export ORACLE_SID="${ORACLE_SID}1"
+    elif [ "$SIDs" = "${ORACLE_SID}2" ]
+    then
+      SKIP="no"
+      export CVORARACDBNAME=$ORACLE_SID
+      export ORACLE_SID="${ORACLE_SID}2"
+    fi
+  done
+
+  # continue if the database is up 
+  if [ "$SKIP" = "no" ]
+  then
+    ORAENV_ASK=NO
+#    . oraenv 1>/dev/null 2>/dev/null
+    echo ""
+    echo "Processing ${ORACLE_SID}..."
+
+    # check if the database is primary, skip for other modes
+    ROLE=`
+{
+echo "set echo off";
+echo "set feedback off ";
+echo "set pages 0";
+echo "set head off";
+echo 'select DATABASE_ROLE from v$database;'
+echo "exit";
+} | sqlplus -s '/ as sysdba'
+`
+    if [ "$ROLE" = 'PRIMARY' ]
+    then
+      echo "-> $ORACLE_SID is a primary database. Continuing..."
+
+      # cheic if the database is in ARCHIVELOGMODE, skip for noarchivelog
+      LOG_MODE=`
+{
+echo "set echo off";
+echo "set feedback off ";
+echo "set pages 0";
+echo "set head off";
+echo 'select LOG_MODE from v$database;'
+echo "exit";
+} | sqlplus -s '/ as sysdba'
+`
+
+      if [ "$LOG_MODE" = 'ARCHIVELOG' ]
+      then
+        echo "--> $ORACLE_SID is in ARCHIVELOG mode.  Continuing..."
+
+        # get archivelog destination name
+        ARCH_DEST=`
+{
+echo "set echo off";
+echo "set feedback off ";
+echo "set pages 0";
+echo "set head off";
+echo 'archive log list;'
+echo "exit";
+} | sqlplus -s '/ as sysdba' | grep -i "Archive destination" | awk '{print $3}'
+`
+
+        echo "---> Archive destination: $ARCH_DEST"
+
+        # check if it's FRA
+        if [ "$ARCH_DEST" = 'USE_DB_RECOVERY_FILE_DEST' -o "$ARCH_DEST" = 'DB_RECOVERY_FILE_DEST' ]
+        then
+
+          # check FRA usage
+          ARCH_USAGE=`
+{
+echo "set echo off";
+echo "set feedback off ";
+echo "set pages 0";
+echo "set head off";
+echo 'select to_char(round(SPACE_USED/SPACE_LIMIT*100)) FROM V$RECOVERY_FILE_DEST;'
+echo "exit";
+} | sqlplus -s '/ as sysdba'
+`
+          echo "----> FRA usage: ${ARCH_USAGE}%"
+
+        else
+
+          if [ "$(echo $ARCH_DEST | cut -c1)" = "+" ]
+          then
+            # get the diskgroup name
+            ARCH_DEST=$(echo $ARCH_DEST | cut -d"/" -f1)
+            ARCH_DEST=$(echo $ARCH_DEST | sed 's/+//g')
+
+            ARCH_USAGE=`
+{
+echo "set echo off";
+echo "set feedback off ";
+echo "set pages 0";
+echo "set head off";
+echo "select to_char(round((1-(FREE_MB/TOTAL_MB))*100)) from v\\\$asm_diskgroup where NAME='${ARCH_DEST}';"
+echo "exit";
+} | sqlplus -s '/ as sysdba'
+`
+
+          else
+            # Get arch usage
+            case $OS_NAME in
+              AIX)     ARCH_USAGE=$(df -k ${ARCH_DEST} | tail -1 | awk '{print $4}' | sed 's/\%//');;
+              Linux)   ARCH_USAGE=$(df -k ${ARCH_DEST} | tail -1 | awk '{print $4}' | sed 's/\%//');;
+              SunOS)   ARCH_USAGE=$(df -k ${ARCH_DEST} | tail -1 | awk '{print $5}' | sed 's/\%//');;
+              HP-UX)   ARCH_USAGE=$(bdf ${ARCH_DEST} | tail -1 | awk '{print $4}' | sed 's/\%//');;
+              *)       echo "ERROR, do not know operating system $OS_NAME" >&2
+                       exit 1 ;;
+            esac
+
+          fi
+
+          echo "----> Destination usage:  ${ARCH_USAGE}%"
+        fi
+
+        # check if max usage threshold is exceeded
+        if [ $ARCH_USAGE -ge $MAX_ARCH_USAGE ]
+        then
+          echo "----> Archivelog usage threshold (${MAX_ARCH_USAGE}%) exceeded (current time: $(date +%Y-%m-%d_%H:%M:%S))."
+
+          # check the number of currently running archivelog backup jobs
+          CURRENTLY_RUNNING=`
+{
+echo "set echo off";
+echo "set feedback off ";
+echo "set pages 0";
+echo "set head off";
+echo "select to_char(count(1)) from V\\\$RMAN_BACKUP_JOB_DETAILS where INPUT_TYPE LIKE '%ARC%' and status like '%RUNNING%';"
+echo "exit";
+} | sqlplus -s '/ as sysdba'
+`
+          if [ $CURRENTLY_RUNNING -ge 1 ]
+          then
+            echo "-----> Number of currently running archivelog backup jobs: ${CURRENTLY_RUNNING}. Will not start another one. Exiting..."
+          else
+            echo "-----> Number of currently running archivelog backup jobs: ${CURRENTLY_RUNNING}. Staring archivelog backup job..."
+
+            # start archivelog backup
+            case $OS_NAME in
+              Linux-CV) 
+                     HOSTNAME=$(hostname -s)
+
+                     # adjust channel definition for RAC
+                     if [ "$CVORARACDBNAME" != "" ]
+                     then
+                       export CVORARACDBNAME=",CVOraRacDBName=${CVORARACDBNAME}"
+                     fi
+                     # temporarily disable RAC-aware channel definition
+                     export CVORARACDBNAME=""
+
+                     export CVORASID=",CvOraSID=${ORACLE_SID}"
+                     if [ "$2" = 'NO_CvOraSID' ]
+                     then
+                       export CVORASID=""
+                     fi
+
+                     # check if Exadata
+                     CELLS=`
+{
+echo "set echo off";
+echo "set feedback off ";
+echo "set pages 0";
+echo "set head off";
+echo "select count(1) from (select distinct cell_name from v\\\$cell_state);"
+echo "exit";
+} | sqlplus -s '/ as sysdba'
+`
+                     if [ $CELLS -ge 1 ]
+                     then
+                       rman <<!
+set echo off;
+connect target /
+set echo on;
+RUN
+{
+ sql 'alter system set "_backup_disk_bufcnt"=64 scope=memory';
+ sql 'alter system set "_backup_disk_bufsz"=1048576 scope=memory';
+ sql 'alter system set "_backup_file_bufcnt"=64 scope=memory';
+ sql 'alter system set "_backup_file_bufsz"=1048576 scope=memory';
+
+ allocate channel ch01 device type disk format '/zfssa/sl02-bck01/${ORADBNAME}/%d_%s_%t_%p';
+ allocate channel ch02 device type disk format '/zfssa/sl02-bck02/${ORADBNAME}/%d_%s_%t_%p';
+ allocate channel ch03 device type disk format '/zfssa/sl02-bck03/${ORADBNAME}/%d_%s_%t_%p';
+ allocate channel ch04 device type disk format '/zfssa/sl02-bck04/${ORADBNAME}/%d_%s_%t_%p';
+
+ set command id to 'RMAN archivelog spooling to disk';
+ backup archivelog all delete input;
+}
+exit;
+!
+
+                     else
+
+                       rman <<! 
+set echo off;
+connect target /
+set echo on;
+configure retention policy to recovery window of 31 days;
+RUN
+{
+allocate channel ch1 type 'sbt_tape'
+PARMS="SBT_LIBRARY=/appl/commvault/simpana/Base/libobk.so,ENV=(CvClientName=${HOSTNAME},CvInstanceName=Instance001${CVORARACDBNAME}${CVORASID})" ;
+backup archivelog all delete input;
+}
+exit;
+!
+                     fi
+                     ;;
+              Linux) 
+                     rman <<!
+set echo off;
+connect target /
+set echo on;
+configure default device type to sbt;
+RUN
+{
+set command id to 'RMAN archivelog spooling to nsr';
+#send 'NSR_ENV=(NSR_DATA_VOLUME_POOL={{ item.extra_vars.nsr_data_volume_pool | default('nsr_pool',true) }})';
+backup archivelog all delete input;
+}
+exit;
+!
+                     ;;
+
+              SunOS)
+                     rman <<!
+set echo off;
+connect target /
+set echo on;
+RUN
+{
+set command id to 'RMAN archivelog spooling';
+backup archivelog all delete input;
+}
+exit;
+!
+                     ;;
+
+                  *) echo "Unknown O/S"
+                     return 1 ;;
+            esac
+
+          fi
+
+        else
+          echo "----> Archivelog usage threshold (${MAX_ARCH_USAGE}%) is not exceeded. Nothing to do. Exiting..."
+        fi
+
+      else
+        echo "--> $ORACLE_SID is in NOARCHIVELOG mode. Nothing to do. Exiting..."
+      fi
+
+    else
+      echo "-> $ORACLE_SID is NOT a primary database. Nothing to do. Exiting..." 
+    fi
+
+  fi
+
+done
+

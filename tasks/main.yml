@@ -1,0 +1,42 @@
+---
+
+- name: create scripts directory
+  file: path={{ oracle_scripts_dir }} state=directory owner={{ oracle_user }} group={{ oracle_dba_group }} mode=0755
+  when: oracle_host_cron_copy_scripts
+  tags:
+    - oracle_host_cron_scripts_directory
+
+- name: copy scripts
+  template:
+    src: "{{ item.file }}"
+    dest: "{{ item.dest }}"
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  with_items:
+    - "{{ oracle_host_cron_templates_to_copy }}"
+  loop_control:
+    label: "file: {{ item.file }}, dest: {{ item.dest }}]"
+  when: oracle_host_cron_copy_scripts
+  tags:
+    - oracle_host_cron_copy_scripts
+
+- name: set up cron jobs
+  cron:
+    name: "{{ item.name }}"
+    job: "{{ item.job }}"
+    minute: "{{ item.minute|default(omit) }}"
+    hour: "{{ item.hour|default(omit) }}"
+    day: "{{ item.day|default(omit) }}"
+    weekday: "{{ item.weekday|default(omit) }}"
+    month: "{{ item.month|default(omit) }}"
+    state: "{{ item.state|default('present',true) }}"
+    disabled: "{{ oracle_host_cron_disabled_item }}"
+  with_items:
+    - "{{ oracle_host_cron_config }}"
+  loop_control:
+    label: "job: {{ item.job }}, state: {{ item.state|default('present',true) }}, disabled: {{ oracle_host_cron_disabled_item }}]"
+  when: oracle_host_cron_manage_cron_jobs
+  tags:
+    - oracle_host_cron_setup
+

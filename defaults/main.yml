@@ -1,0 +1,56 @@
+---
+
+# whether or not copy scripts enlisted in 'oracle_host_cron_templates_to_copy' to target hosts
+oracle_host_cron_copy_scripts: true
+
+# files to be copied to remote host
+oracle_host_cron_templates_to_copy:
+  - file: backup_arch_emergency.ksh.j2
+    dest: '{{ oracle_scripts_dir }}/backup_arch_emergency.ksh'
+    owner: '{{ oracle_user }}'
+    group: '{{ oracle_dba_group }}'
+    mode: '0750'
+    extra_vars:
+      max_arch_usage: "{{ oracle_host_cron_backup_arch_emergency_max_arch_usage | default(70,true) }}"
+      nsr_data_volume_pool: "{{ oracle_nsr_data_volume_pool | default('nsr_pool',true) }}"
+  - file: rman_delete_expired.ksh.j2
+    dest: '{{ oracle_scripts_dir }}/rman_delete_expired.ksh'
+    owner: '{{ oracle_user }}'
+    group: '{{ oracle_dba_group }}'
+    mode: '0750'
+    extra_vars:
+      rmancat_connection_string: "{{ oracle_rmancat_connection_string | default('rmancat/secret@RMANCAT',true) }}"
+  - file: rman_resync_catalog.ksh.j2
+    dest: '{{ oracle_scripts_dir }}/rman_resync_catalog.ksh'
+    owner: '{{ oracle_user }}'
+    group: '{{ oracle_dba_group }}'
+    mode: '0750'
+    extra_vars:
+      rmancat_connection_string: "{{ oracle_rmancat_connection_string | default('rmancat/secret@RMANCAT',true) }}"
+
+# cron config
+oracle_host_cron_config:
+  - name: "backup_arch_emergency script to backup archivelogs when FRA utilisation threshold is exceeded"
+    job: "{{ oracle_scripts_dir }}/backup_arch_emergency.ksh >/dev/null 2>&1"
+    minute: "*/5"
+    state: present
+    disabled: no
+  - name: "rman_delete_expired script deletes records of the expired backups from the recovery catalog"
+    job: "{{ oracle_scripts_dir }}/rman_delete_expired.ksh >/dev/null 2>&1"
+    hour: "{{ 11 |random }}" 
+    minute: "{{ 59 |random }}" 
+    state: present
+    disabled: no
+  - name: "rman_resync_catalog script to resync backups with the catalog database"
+    job: "{{ oracle_scripts_dir }}/rman_resync_catalog.ksh >/dev/null 2>&1"
+    hour: "*/6"
+    minute: "{{ 59 |random }}"
+    state: present
+    disabled: no
+
+# whether or not manage cron jobs
+oracle_host_cron_manage_cron_jobs: true
+
+# whether or not disable cron jobs enlisted in 'oracle_host_cron_config' (for example: maintenance/patching)
+oracle_host_cron_disable_jobs: false
+

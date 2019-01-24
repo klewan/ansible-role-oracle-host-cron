@@ -1,0 +1,4 @@
+---
+
+oracle_host_cron_disabled_item: "{% if oracle_host_cron_disable_jobs %}yes{% else %}{{ item.disabled|default('no',true) }}{% endif %}"
+

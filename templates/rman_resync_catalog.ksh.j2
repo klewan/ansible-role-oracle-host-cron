@@ -1,0 +1,158 @@
+#!/bin/ksh
+# ----------------------------------------------------------------------
+# File: rman_resync_catalog.ksh.j2
+#
+# The script executes 'RESYNC CATALOG'
+#
+# History:
+#
+# Date       Author       Comments
+# ---------- ------------ ----------------------------------------------
+# 06/09/2017 KLewandowski Created
+# ----------------------------------------------------------------------
+#
+# SYNTAX : rman_resync_catalog.ksh
+#
+
+DIR="$(dirname $0)"
+if [ "$DIR" = "." ]
+then
+  DIR=$(pwd)
+fi
+
+LOG_DIR=$DIR/log
+
+#
+# Create logfile
+#
+
+VDATE="$(date +%Y%m%d_%H%M%S)"
+SCRIPT="$(basename $0 .ksh)"
+#echo "Logfile -> $LOG_DIR/${SCRIPT}.log"
+# To enable logging uncomment next line
+#exec 1>>$LOG_DIR/${SCRIPT}.log 2>&1
+echo ""
+echo "======="
+echo "$SCRIPT : Timestamp: $(date +%Y-%m-%d_%H:%M:%S)"
+echo "======="
+
+# Get os name
+OS_NAME="$(uname -s)"
+
+# Get oratab location
+case $OS_NAME in
+  AIX) ORATAB=/etc/oratab ;;
+  Linux) ORATAB=/etc/oratab ;;
+  HP-UX) ORATAB=/etc/oratab ;;
+  SunOS) ORATAB=/var/opt/oracle/oratab ;;
+  *) echo "Unknown O/S"
+     return 1 ;;
+esac
+
+if [ ! -f $ORATAB ]
+then
+  echo "Cannot find oratab file"
+  exit 1
+fi
+
+BASE_PATH=$PATH
+
+# iterate over oratab entries
+for LINE in $(awk ' $1!~ /[#*]/ {print $1} ' $ORATAB | sed '/^$/d' | grep -iv +ASM | cut -d: -f1,2)
+do
+  ORACLE_SID=`echo $LINE|cut -d: -f1`
+  export ORACLE_SID
+  ORACLE_HOME=`echo $LINE|cut -d: -f2`
+  export ORACLE_HOME
+  export PATH=$ORACLE_HOME/bin:$BASE_PATH
+  export ORADBNAME=$ORACLE_SID
+
+  # check if the database is up and in addition to that amend ORACLE_SID in case of RAC system
+  SKIP="yes"
+  for SIDs in $(ps -eaf | grep ora_smon_${ORACLE_SID} | grep -v grep | awk '{print $NF}' | cut -d"_" -f3)
+  do
+    if [ "$SIDs" = "${ORACLE_SID}" ]
+    then
+      SKIP="no"
+    elif [ "$SIDs" = "${ORACLE_SID}1" ]
+    then
+      SKIP="no"
+      export ORACLE_SID="${ORACLE_SID}1"
+    elif [ "$SIDs" = "${ORACLE_SID}2" ]
+    then
+      SKIP="no"
+      export ORACLE_SID="${ORACLE_SID}2"
+    fi
+  done
+
+  # continue if the database is up 
+  if [ "$SKIP" = "no" ]
+  then
+    ORAENV_ASK=NO
+#    . oraenv 1>/dev/null 2>/dev/null
+    echo ""
+    echo "Processing ${ORACLE_SID}..."
+
+    # check if the database is primary, skip for other modes
+    ROLE=`
+{
+echo "set echo off";
+echo "set feedback off ";
+echo "set pages 0";
+echo "set head off";
+echo 'select DATABASE_ROLE from v$database;'
+echo "exit";
+} | sqlplus -s '/ as sysdba'
+`
+    if [ "$ROLE" = 'PRIMARY' ]
+    then
+      echo "-> $ORACLE_SID is a primary database. Continuing..."
+
+      # cheic if the database is in ARCHIVELOGMODE, skip for noarchivelog
+      LOG_MODE=`
+{
+echo "set echo off";
+echo "set feedback off ";
+echo "set pages 0";
+echo "set head off";
+echo 'select LOG_MODE from v$database;'
+echo "exit";
+} | sqlplus -s '/ as sysdba'
+`
+
+      if [ "$LOG_MODE" = 'ARCHIVELOG' ]
+      then
+        echo "--> $ORACLE_SID is in ARCHIVELOG mode.  Continuing..."
+
+        # register database - in case it has not been done before
+        rman <<EOF >/dev/null 2>&1
+set echo off;
+connect target /
+connect catalog {{ item.extra_vars.rmancat_connection_string | default('rmancat/secret@RMANCAT',true) }}
+set echo on;
+register database;
+EOF
+
+        echo "--> running RESYNC CATALOG ..."
+
+        # resync catalog needed to keep the databases in sync with catalog database
+        rman <<EOF
+set echo off;
+connect target /
+connect catalog {{ item.extra_vars.rmancat_connection_string | default('rmancat/secret@RMANCAT',true) }}
+set echo on;
+resync catalog;
+EOF
+
+      else
+        echo "--> $ORACLE_SID is in NOARCHIVELOG mode. Nothing to do. Exiting..."
+      fi
+
+    else
+      echo "-> $ORACLE_SID is NOT a primary database. Nothing to do. Exiting..." 
+    fi
+
+  fi
+
+done
+
